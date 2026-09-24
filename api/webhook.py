@@ -20,8 +20,11 @@ Deploy ke Vercel:
 import os
 import re
 import time
+import json
 import logging
 import tempfile
+import urllib.parse
+import urllib.request
 from urllib.parse import urlparse
 
 import telebot
@@ -194,14 +197,136 @@ def get_resolution_label(height):
     return f"{height}p"
 
 
+# ── Khusus RedNote / XiaoHongShu Extractor ───────────────
+
+def extract_rednote(url: str):
+    """
+    Ekstrak video atau foto dari RedNote (XiaoHongShu) tanpa watermark.
+    Menggunakan mobile client flow untuk mem-bypass login redirect.
+    Mendukung link xhslink.com, xhs.link, discovery/item, dan explore.
+    """
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) "
+            "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 "
+            "Mobile/15E148 Safari/604.1"
+        ),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+    }
+
+    try:
+        req = urllib.request.Request(url, headers=headers)
+        opener = urllib.request.build_opener()
+        resp = opener.open(req, timeout=12)
+        final_url = resp.geturl()
+        html = resp.read().decode("utf-8", errors="ignore")
+    except Exception as e:
+        logger.error(f"RedNote fetch failed for {url}: {e}")
+        return {"success": False, "error": f"Gagal mengakses link: {e}"}
+
+    # Jika diarahkan ke login, ekstrak real target URL dari redirectPath
+    if "login?redirectPath=" in final_url or "login?redirectPath=" in html:
+        m_redirect = re.search(r'redirectPath=([^"\'&]+)', final_url) or re.search(r'redirectPath=([^"\'&]+)', html)
+        if m_redirect:
+            target = urllib.parse.unquote(m_redirect.group(1))
+            try:
+                req2 = urllib.request.Request(target, headers=headers)
+                resp2 = opener.open(req2, timeout=12)
+                html = resp2.read().decode("utf-8", errors="ignore")
+            except Exception as e:
+                logger.warning(f"RedNote redirect fetch failed: {e}")
+
+    # Ekstrak state JSON
+    m = re.search(r'window\.__INITIAL_STATE__\s*=\s*({.*?});?</script>', html)
+    if not m:
+        return {"success": False, "error": "Tidak dapat mengekstrak data dari halaman RedNote."}
+
+    clean_json = m.group(1).replace(":undefined", ":null")
+    try:
+        data = json.loads(clean_json)
+    except Exception as e:
+        return {"success": False, "error": f"Gagal membaca data RedNote: {e}"}
+
+    note = data.get("noteData", {}).get("data", {}).get("noteData", {})
+    if not note and "note" in data:
+        detail = data.get("note", {}).get("noteDetailMap", {})
+        if detail:
+            note = list(detail.values())[0].get("note", {})
+
+    if not note:
+        return {"success": False, "error": "Data postingan RedNote tidak ditemukan."}
+
+    title = note.get("title") or (note.get("desc", "").strip()[:80] if note.get("desc") else "RedNote Video")
+    video = note.get("video", {})
+    media = video.get("media", {})
+    stream = media.get("stream", {})
+
+    formats = stream.get("h264") or stream.get("h265") or []
+    if not formats:
+        # Cek apakah postingan berupa kumpulan foto/gambar
+        image_list = note.get("imageList", [])
+        if image_list:
+            images = [
+                img.get("urlDefault") or img.get("url")
+                for img in image_list
+                if img.get("urlDefault") or img.get("url")
+            ]
+            if images:
+                return {
+                    "success": True,
+                    "is_photos": True,
+                    "title": title,
+                    "images": images,
+                    "platform": "rednote",
+                    "original_url": url,
+                }
+        return {"success": False, "error": "Video atau gambar tidak ditemukan pada postingan ini."}
+
+    # Ambil format kualitas tertinggi (preferensi h264 agar kompatibel Telegram)
+    best_fmt = max(formats, key=lambda f: (f.get("height", 0), f.get("videoBitrate", 0)))
+    direct_url = best_fmt.get("masterUrl") or (best_fmt.get("backupUrls", [None])[0])
+
+    height = best_fmt.get("height", 0)
+    width = best_fmt.get("width", 0)
+    filesize = best_fmt.get("size", 0)
+    duration = int(best_fmt.get("duration", 0) / 1000) if best_fmt.get("duration") else 0
+    res_label = get_resolution_label(height)
+
+    return {
+        "success": True,
+        "is_photos": False,
+        "title": title[:100],
+        "duration": duration,
+        "thumbnail": note.get("cover", {}).get("url"),
+        "uploader": note.get("user", {}).get("nickname", "RedNote User"),
+        "direct_url": direct_url,
+        "height": height,
+        "width": width,
+        "resolution": res_label,
+        "filesize": filesize,
+        "ext": "mp4",
+        "original_url": url,
+        "platform": "rednote",
+    }
+
+
 # ── Core: Ekstrak Info & Direct URL ──────────────────────
 
 def extract_video_info(url: str, platform: str):
     """
-    Ekstrak informasi video dan direct URL menggunakan yt-dlp.
+    Ekstrak informasi video dan direct URL.
     TIDAK mendownload file — hanya ambil metadata & URL langsung.
     Ini sangat cepat (~2-5 detik).
     """
+    # Khusus RedNote / XiaoHongShu: gunakan custom extractor (bypass login redirect)
+    if platform == "rednote" or any(d in url for d in PLATFORMS.get("rednote", {}).get("domains", [])):
+        logger.info(f"Using custom RedNote extractor for: {url}")
+        rn_info = extract_rednote(url)
+        if rn_info.get("success"):
+            return rn_info
+        logger.warning(f"Custom RedNote extractor failed: {rn_info.get('error')}, falling back to yt-dlp")
+
     fmt = FORMAT_OPTIONS.get(platform, {"format": "best"})
 
     ydl_opts = {
@@ -306,14 +431,54 @@ def extract_video_info(url: str, platform: str):
 
 # ── Fallback: Download File ke /tmp ──────────────────────
 
-def download_to_file(url: str, platform: str):
+def download_to_file(url: str, platform: str, direct_url: str = None):
     """
     Fallback: download video ke file temporary.
-    Digunakan jika kirim via URL gagal.
+    Jika direct_url tersedia, download langsung via HTTP stream (sangat cepat & bypass login).
+    Jika tidak, gunakan yt-dlp.
     """
     tmp_dir = tempfile.mkdtemp()
     timestamp = int(time.time() * 1000)
-    output_path = os.path.join(tmp_dir, f"{platform}_{timestamp}.%(ext)s")
+    output_path = os.path.join(tmp_dir, f"{platform}_{timestamp}.mp4")
+
+    # Jika direct_url tersedia, download langsung via HTTP stream
+    if direct_url:
+        try:
+            logger.info(f"Downloading directly from stream URL: {direct_url[:80]}...")
+            headers = {
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/131.0.0.0 Safari/537.36"
+                ),
+                "Referer": "https://www.xiaohongshu.com/",
+            }
+            resp = requests.get(direct_url, headers=headers, stream=True, timeout=25)
+            if resp.status_code in (200, 206):
+                downloaded_size = 0
+                with open(output_path, "wb") as f:
+                    for chunk in resp.iter_content(chunk_size=1024 * 1024):
+                        if chunk:
+                            f.write(chunk)
+                            downloaded_size += len(chunk)
+                            if downloaded_size > TELEGRAM_FILE_LIMIT:
+                                os.remove(output_path)
+                                return {
+                                    "success": False,
+                                    "error": f"File terlalu besar ({format_size(downloaded_size)}). Batas: 50MB.",
+                                }
+                if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
+                    return {
+                        "success": True,
+                        "file_path": output_path,
+                        "title": "Video",
+                        "duration": 0,
+                        "file_size": os.path.getsize(output_path),
+                        "height": 0,
+                    }
+        except Exception as e:
+            logger.warning(f"Direct stream download failed: {e}")
+            # Lanjut ke yt-dlp
 
     fmt = FORMAT_OPTIONS.get(platform, {"format": "best"})
 
@@ -392,6 +557,7 @@ def send_video_to_user(chat_id, video_info, platform_info):
     Kirim video ke user dengan strategi 2 tahap:
     1. Coba kirim via direct URL (cepat, HD)
     2. Fallback: download & upload file
+    Mendukung juga pengiriman foto/album (misal RedNote image post).
     """
     title = video_info.get("title", "Video")
     duration = video_info.get("duration", 0)
@@ -400,6 +566,38 @@ def send_video_to_user(chat_id, video_info, platform_info):
     thumbnail = video_info.get("thumbnail")
     filesize = video_info.get("filesize", 0)
     uploader = video_info.get("uploader", "")
+
+    # ━━━━━━ JIKA POSTINGAN BERUPA FOTO / ALBUM ━━━━━━
+    if video_info.get("is_photos") and video_info.get("images"):
+        images = video_info["images"]
+        caption_photo = (
+            f"{platform_info['emoji']} <b>{platform_info['name']}</b>\n"
+            f"📸 {title}\n"
+            f"🖼 {len(images)} Foto HD tanpa watermark"
+        )
+        try:
+            if len(images) == 1:
+                bot.send_photo(chat_id, photo=images[0], caption=caption_photo, parse_mode="HTML")
+            else:
+                media_group = [
+                    telebot.types.InputMediaPhoto(
+                        img,
+                        caption=caption_photo if i == 0 else "",
+                        parse_mode="HTML"
+                    )
+                    for i, img in enumerate(images[:10])
+                ]
+                bot.send_media_group(chat_id, media=media_group)
+            logger.info("✅ Photo(s) sent successfully!")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to send media group: {e}")
+            for img in images[:5]:
+                try:
+                    bot.send_photo(chat_id, photo=img)
+                except Exception:
+                    pass
+            return True
 
     # Bangun caption
     res_text = f" • 🎞 {resolution}" if resolution else ""
@@ -433,8 +631,9 @@ def send_video_to_user(chat_id, video_info, platform_info):
     try:
         logger.info("Trying fallback: download to file...")
         result = download_to_file(
-            video_info["original_url"],
-            detect_platform(video_info["original_url"]) or "unknown",
+            video_info.get("original_url", ""),
+            detect_platform(video_info.get("original_url", "")) or "unknown",
+            direct_url=direct_url,
         )
 
         if result["success"] and result.get("file_path"):
