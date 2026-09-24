@@ -34,8 +34,13 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # ── Config ────────────────────────────────────────────────
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
-bot = telebot.TeleBot(BOT_TOKEN, threaded=False)
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
+IS_TOKEN_VALID = bool(BOT_TOKEN and ":" in BOT_TOKEN)
+
+# TeleBot requires a token with colon format even at instantiation.
+# If not valid, use dummy token so route handlers & decorators don't crash on import.
+_init_token = BOT_TOKEN if IS_TOKEN_VALID else "123456789:AAABBBCCCDDDEEEFFFGGGHHHIIIJJJKKKLL"
+bot = telebot.TeleBot(_init_token, threaded=False)
 app = Flask(__name__)
 
 # Batas ukuran file Telegram Bot API (50MB)
@@ -726,18 +731,32 @@ def handle_url(message):
 @app.route("/", methods=["GET"])
 def index():
     """Health check endpoint."""
+    has_token = bool(BOT_TOKEN)
     return jsonify({
         "status": "ok",
         "bot": "Video Downloader Bot HD",
         "version": "2.0",
         "features": ["HD quality", "No watermark", "6 platforms"],
         "platforms": list(PLATFORMS.keys()),
+        "bot_configured": IS_TOKEN_VALID,
+        "token_status": "Ready" if IS_TOKEN_VALID else "Empty / Not configured in Vercel",
     })
 
 
-@app.route("/api/webhook", methods=["POST"])
+@app.route("/api/webhook", methods=["GET", "POST"])
 def webhook():
     """Endpoint webhook yang dipanggil Telegram."""
+    if request.method == "GET":
+        return jsonify({
+            "status": "active",
+            "bot_configured": IS_TOKEN_VALID,
+            "info": "This endpoint receives POST updates from Telegram.",
+        })
+
+    if not IS_TOKEN_VALID:
+        logger.error("BOT_TOKEN is not valid or not set!")
+        return "Bot not configured", 500
+
     if request.headers.get("content-type") == "application/json":
         json_data = request.get_data().decode("utf-8")
         update = telebot.types.Update.de_json(json_data)
@@ -753,24 +772,39 @@ def set_webhook():
     Akses URL ini 1x setelah deploy:
     https://your-app.vercel.app/api/set_webhook
     """
-    vercel_url = request.host_url.rstrip("/")
-    webhook_url = f"{vercel_url}/api/webhook"
-
-    # Hapus webhook lama & set yang baru
-    bot.remove_webhook()
-    success = bot.set_webhook(url=webhook_url)
-
-    if success:
-        return jsonify({
-            "status": "success",
-            "message": f"Webhook berhasil di-set ke: {webhook_url}",
-            "webhook_url": webhook_url,
-            "quality": "HD (up to 1080p)",
-        })
-    else:
+    if not IS_TOKEN_VALID:
         return jsonify({
             "status": "error",
-            "message": "Gagal set webhook. Cek BOT_TOKEN.",
+            "message": "BOT_TOKEN belum disetting dengan benar di Vercel Environment Variables. Format token harus memiliki titik dua (contoh: 123456789:ABCdef...).",
+            "has_token": bool(BOT_TOKEN),
+        }), 500
+
+    # Pastikan selalu memakai HTTPS untuk Telegram webhook
+    host = request.headers.get("x-forwarded-host", request.host)
+    webhook_url = f"https://{host}/api/webhook"
+
+    try:
+        # Hapus webhook lama & set yang baru
+        bot.remove_webhook()
+        success = bot.set_webhook(url=webhook_url)
+
+        if success:
+            return jsonify({
+                "status": "success",
+                "message": f"Webhook berhasil di-set ke: {webhook_url}",
+                "webhook_url": webhook_url,
+                "quality": "HD (up to 1080p)",
+            })
+        else:
+            return jsonify({
+                "status": "error",
+                "message": "Gagal set webhook. Telegram menolak token atau URL.",
+            }), 500
+    except Exception as e:
+        logger.error(f"Error setting webhook: {e}", exc_info=True)
+        return jsonify({
+            "status": "error",
+            "message": f"Error setting webhook: {str(e)}",
         }), 500
 
 

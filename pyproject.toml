@@ -1,0 +1,15 @@
+[project]
+name = "bot-telegram-v2"
+version = "0.1.0"
+description = "Telegram Video Downloader Bot HD"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "flask>=3.0.0",
+    "pyTelegramBotAPI>=4.18.0",
+    "yt-dlp>=2024.12.01",
+    "requests>=2.31.0",
+]
+
+[tool.vercel]
+entrypoint = "api.webhook:app"
